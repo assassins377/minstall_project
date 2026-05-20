@@ -16,7 +16,7 @@ os.makedirs(LOG_DIR, exist_ok=True)
 LOG_FILE = os.path.join(LOG_DIR, "install.log")
 
 # --- Версионирование ---
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.2.0"
 CONFIG_VERSION = 2
 
 # --- Символы UI ---
@@ -36,6 +36,13 @@ WATCHDOG_SAMPLE_INTERVAL = 30  # секунды между замерами
 WATCHDOG_HANG_THRESHOLD = 5    # сколько подряд "тихих" замеров → killing
 WATCHDOG_CPU_THRESHOLD = 0.5   # CPU% ниже которого считаем процесс "тихим"
 
+# --- Параллельная установка ---
+PARALLEL_INSTALL_ENABLED = False  # дефолт — последовательно (безопаснее)
+MAX_PARALLEL_JOBS = 3             # одновременно запускаемых инсталляторов
+# MSI запускает Windows Installer Service, который эксклюзивен — два MSI
+# параллельно вернут ERROR_INSTALL_ALREADY_RUNNING (1618). Поэтому .msi
+# принудительно сериализуется через семафор размера 1.
+
 # --- Обновления ---
 DOWNLOAD_TIMEOUT = 30  # секунды для каждого read() чанка
 DOWNLOAD_CHUNK_SIZE = 64 * 1024  # 64 КБ
@@ -43,6 +50,19 @@ DOWNLOAD_CHUNK_SIZE = 64 * 1024  # 64 КБ
 # --- GUI ---
 SEARCH_DEBOUNCE_MS = 300
 
+# --- Watcher: следит за изменениями в software/ ---
+WATCHER_ENABLED = True
+WATCHER_POLL_INTERVAL_MS = 3000  # 3 секунды — баланс между отзывчивостью и нагрузкой
+# Доступные интервалы для пользовательских настроек (мс). 0 = выключено
+WATCHER_INTERVALS_MS = [0, 3000, 10000, 30000, 60000]
+
+# --- Кеш списка установленных программ из реестра ---
+# Реестр Windows читается ~200-500мс. Кешируем результат на TTL минут чтобы
+# повторные запуски и переоткрытия окна были мгновенными.
+INSTALLED_CACHE_TTL_SECONDS = 600  # 10 минут
+
 # --- Допустимые расширения инсталляторов ---
 ALLOWED_CMD_EXTENSIONS = {".exe", ".msi", ".bat", ".cmd", ".ps1", ".reg"}
+# Особые исполняемые команды без расширения (системные утилиты)
+ALLOWED_BARE_COMMANDS = {"winget", "choco"}
 SHELL_METACHARACTERS = {"&", "|", "&&", "||", ";", "`", "$", ">", "<", "^"}

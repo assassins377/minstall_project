@@ -1,0 +1,10 @@
+{
+  "name": "Office",
+  "description": "Минимальный набор для офисного компьютера",
+  "programs": [
+    "Microsoft .NET Framework 4.8",
+    "Microsoft Visual C++ 2005-2022 Redistributable",
+    "Google Chrome",
+    "LibreOffice"
+  ]
+}

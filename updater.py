@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import struct
 import sys
 import json
 import hashlib
@@ -18,11 +19,26 @@ import core
 GITHUB_REPO = "assassins377/minstall_project"
 RELEASES_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
-# Имя главного exe-файла в Release assets и его контрольной суммы
-EXE_ASSET_NAME = "MInstAll_x86.exe"
-SHA256_ASSET_NAME = f"{EXE_ASSET_NAME}.sha256"
-
 USER_AGENT = f"MInstAll/{config.APP_VERSION}"
+
+
+def current_arch() -> str:
+    """Возвращает 'x64' или 'x86' в зависимости от разрядности текущего процесса.
+
+    Важно: смотрим именно на текущий Python/exe, а не на ОС — потому что 32-битный
+    exe может бежать на 64-битной системе, и обновлять его надо тем же x86.
+    """
+    return "x64" if struct.calcsize("P") == 8 else "x86"
+
+
+def exe_asset_name() -> str:
+    """Имя .exe ассета в Release для текущей архитектуры."""
+    return f"MInstAll_{current_arch()}.exe"
+
+
+def sha256_asset_name() -> str:
+    """Имя .sha256 ассета для текущей архитектуры."""
+    return f"{exe_asset_name()}.sha256"
 
 
 # ------------------------------------------------------------------
@@ -69,30 +85,34 @@ def check_for_updates(current_version: str | None = None) -> dict:
     notes = release.get("body", "") or ""
     assets = release.get("assets", []) or []
 
+    # Динамическое имя по архитектуре текущего процесса (x86 / x64)
+    exe_name = exe_asset_name()
+    sha_name = sha256_asset_name()
+
     # Ищем основной .exe
-    exe_asset = next((a for a in assets if a.get("name") == EXE_ASSET_NAME), None)
+    exe_asset = next((a for a in assets if a.get("name") == exe_name), None)
     if not exe_asset:
-        return {"error": f"В релизе v{tag} нет файла {EXE_ASSET_NAME}"}
+        return {"error": f"В релизе v{tag} нет файла {exe_name}"}
 
     exe_url = exe_asset.get("browser_download_url")
     exe_size = exe_asset.get("size")
     if not exe_url:
-        return {"error": f"У файла {EXE_ASSET_NAME} нет ссылки на скачивание"}
+        return {"error": f"У файла {exe_name} нет ссылки на скачивание"}
 
     # Опционально: .sha256 — отдельный файл с хешем
     sha256: str | None = None
-    sha_asset = next((a for a in assets if a.get("name") == SHA256_ASSET_NAME), None)
+    sha_asset = next((a for a in assets if a.get("name") == sha_name), None)
     if sha_asset and (sha_url := sha_asset.get("browser_download_url")):
         try:
             sha_text = _fetch_text(sha_url, timeout=5)
             # Формат может быть: "abc123..." или "abc123...  MInstAll_x86.exe"
             sha256 = sha_text.split()[0].lower()
         except Exception as e:
-            logging.warning(f"Не удалось прочитать {SHA256_ASSET_NAME}: {e}")
+            logging.warning(f"Не удалось прочитать {sha_name}: {e}")
 
     if not sha256:
         logging.warning(
-            f"В релизе v{tag} нет {SHA256_ASSET_NAME} — обновление пройдёт без верификации SHA-256"
+            f"В релизе v{tag} нет {sha_name} — обновление пройдёт без верификации SHA-256"
         )
 
     has_update = core.compare_versions(tag, current) > 0
@@ -213,11 +233,30 @@ def download_and_update(
 
         emit({"type": "status", "text": "Применение обновления..."})
 
+        # PID текущего процесса — BAT будет ждать пока он не завершится,
+        # вместо хрупкого ping-таймаута. Максимум — 60 секунд защиты от вечного цикла.
+        current_pid = os.getpid()
+
         bat_content = f"""@echo off
 chcp 866 > nul
 echo Обновление MInstAll...
-ping 127.0.0.1 -n 3 > nul
 
+REM Ждём пока текущий процесс завершится (max 60 сек защита от deadlock)
+set /a "waited=0"
+:wait_loop
+tasklist /FI "PID eq {current_pid}" /NH 2>nul | findstr /R /C:"^.* {current_pid} " >nul
+if errorlevel 1 goto proceed
+if %waited% GEQ 60 (
+    echo Процесс {current_pid} не завершился за 60 секунд, прерываем
+    del /Q "{new_exe_path}" >nul 2>&1
+    pause
+    exit /b 1
+)
+timeout /t 1 /nobreak >nul
+set /a "waited+=1"
+goto wait_loop
+
+:proceed
 move /Y "{current_exe}" "{bak_exe_path}" >nul 2>&1
 if errorlevel 1 (
     echo Не удалось создать резервную копию.

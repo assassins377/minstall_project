@@ -1,0 +1,11 @@
+{
+  "name": "Developer",
+  "description": "Базовый набор для разработчика: системные компоненты, браузер, офисный пакет",
+  "programs": [
+    "Microsoft .NET Framework 4.8",
+    "Microsoft Visual C++ 2005-2022 Redistributable",
+    "Google Chrome",
+    "Telegram Desktop",
+    "LibreOffice"
+  ]
+}

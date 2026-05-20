@@ -1,0 +1,9 @@
+{
+  "name": "Minimal",
+  "description": "Только системные компоненты — необходимый минимум",
+  "programs": [
+    "Microsoft .NET Framework 4.8",
+    "DirectX (Июнь 2010)",
+    "Microsoft Visual C++ 2005-2022 Redistributable"
+  ]
+}

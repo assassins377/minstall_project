@@ -22,18 +22,27 @@ jobs:
         pip install -r requirements.txt
     - run: python -m pytest tests/ -v --tb=short
 
-  release:
+  build:
     needs: test
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86
+            python-arch: x86
+          - arch: x64
+            python-arch: x64
+    name: Build ${{ matrix.arch }}
     steps:
     - name: Скачиваем код
       uses: actions/checkout@v4
 
-    - name: Устанавливаем 32-битный Python 3.10
+    - name: Устанавливаем ${{ matrix.arch }} Python 3.10
       uses: actions/setup-python@v5
       with:
         python-version: '3.10'
-        architecture: 'x86'
+        architecture: ${{ matrix.python-arch }}
 
     - name: Устанавливаем зависимости
       run: |
@@ -41,61 +50,124 @@ jobs:
         pip install pyinstaller
         pip install -r requirements.txt
 
+    - name: Компилируем MInstAll_${{ matrix.arch }}.exe (--onefile)
+      run: |
+        pyinstaller --clean --noconsole --onefile --uac-admin --name MInstAll_${{ matrix.arch }} --icon=icons/system.png main.py
+
+    - name: Создаём .sha256 для onefile
+      shell: pwsh
+      run: |
+        $file = "dist/MInstAll_${{ matrix.arch }}.exe"
+        $sha = (Get-FileHash $file -Algorithm SHA256).Hash.ToLower()
+        "$sha  MInstAll_${{ matrix.arch }}.exe" | Out-File -FilePath "dist/MInstAll_${{ matrix.arch }}.exe.sha256" -Encoding ASCII -NoNewline
+
+    - name: Компилируем --onedir версию (быстрый запуск)
+      run: |
+        pyinstaller --clean --noconsole --uac-admin --name MInstAll_${{ matrix.arch }}_dir --icon=icons/system.png main.py
+
+    - name: Архивируем --onedir в .zip
+      shell: pwsh
+      run: |
+        $src = "dist/MInstAll_${{ matrix.arch }}_dir"
+        $zip = "dist/MInstAll_${{ matrix.arch }}_portable.zip"
+        Compress-Archive -Path "$src/*" -DestinationPath $zip -CompressionLevel Optimal
+        $sha = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+        $zipName = "MInstAll_${{ matrix.arch }}_portable.zip"
+        "$sha  $zipName" | Out-File -FilePath "$zip.sha256" -Encoding ASCII -NoNewline
+
+    - name: Загружаем артефакты для финального release-job
+      uses: actions/upload-artifact@v4
+      with:
+        name: MInstAll_${{ matrix.arch }}_artifacts
+        path: |
+          dist/MInstAll_${{ matrix.arch }}.exe
+          dist/MInstAll_${{ matrix.arch }}.exe.sha256
+          dist/MInstAll_${{ matrix.arch }}_portable.zip
+          dist/MInstAll_${{ matrix.arch }}_portable.zip.sha256
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+    - name: Скачиваем код (для шаблона release notes)
+      uses: actions/checkout@v4
+
     - name: Определяем версию из тега
       id: version
-      shell: bash
       run: |
         TAG="${GITHUB_REF#refs/tags/v}"
         echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-        echo "Версия: $TAG"
 
-    - name: Компилируем MInstAll.exe
+    - name: Скачиваем артефакты x86
+      uses: actions/download-artifact@v4
+      with:
+        name: MInstAll_x86_artifacts
+        path: dist/
+
+    - name: Скачиваем артефакты x64
+      uses: actions/download-artifact@v4
+      with:
+        name: MInstAll_x64_artifacts
+        path: dist/
+
+    - name: Проверяем что собрали все варианты
       run: |
-        pyinstaller --clean --noconsole --onefile --name MInstAll_x86 --icon=icons/system.png main.py
+        ls -la dist/
+        test -f dist/MInstAll_x86.exe
+        test -f dist/MInstAll_x86.exe.sha256
+        test -f dist/MInstAll_x86_portable.zip
+        test -f dist/MInstAll_x64.exe
+        test -f dist/MInstAll_x64.exe.sha256
+        test -f dist/MInstAll_x64_portable.zip
 
-    - name: Вычисляем SHA-256 и создаём .sha256 файл
-      id: hash
-      shell: pwsh
+    - name: Извлекаем SHA-256 и размеры
+      id: hashes
       run: |
-        $file = "dist/MInstAll_x86.exe"
-        $sha = (Get-FileHash $file -Algorithm SHA256).Hash.ToLower()
-        $size = (Get-Item $file).Length
-
-        # Файл .sha256 — формат "<hash>  <filename>" (как у sha256sum)
-        "$sha  MInstAll_x86.exe" | Out-File -FilePath "dist/MInstAll_x86.exe.sha256" -Encoding ASCII -NoNewline
-
-        echo "sha256=$sha" >> $env:GITHUB_OUTPUT
-        echo "size=$size" >> $env:GITHUB_OUTPUT
-        echo "SHA-256: $sha"
-        echo "Size: $size bytes"
+        SHA_X86=$(cut -d' ' -f1 dist/MInstAll_x86.exe.sha256)
+        SHA_X64=$(cut -d' ' -f1 dist/MInstAll_x64.exe.sha256)
+        SIZE_X86=$(stat -c%s dist/MInstAll_x86.exe)
+        SIZE_X64=$(stat -c%s dist/MInstAll_x64.exe)
+        echo "sha_x86=$SHA_X86" >> "$GITHUB_OUTPUT"
+        echo "sha_x64=$SHA_X64" >> "$GITHUB_OUTPUT"
+        echo "size_x86=$SIZE_X86" >> "$GITHUB_OUTPUT"
+        echo "size_x64=$SIZE_X64" >> "$GITHUB_OUTPUT"
 
     - name: Формируем описание Release
       id: release_body
-      shell: bash
       run: |
-        SHA="${{ steps.hash.outputs.sha256 }}"
-        SIZE="${{ steps.hash.outputs.size }}"
-        SIZE_KB=$((SIZE / 1024))
+        SHA_X86="${{ steps.hashes.outputs.sha_x86 }}"
+        SHA_X64="${{ steps.hashes.outputs.sha_x64 }}"
+        SIZE_X86_KB=$((${{ steps.hashes.outputs.size_x86 }} / 1024))
+        SIZE_X64_KB=$((${{ steps.hashes.outputs.size_x64 }} / 1024))
 
         cat > release_body.md << ENDBODY
         ## Скачать
 
-        \`MInstAll_x86.exe\` — основной исполняемый файл (32-bit, работает на Windows 7+).
+        Выбери версию под свою систему:
+
+        | Архитектура | Один файл | Портативная (быстрый запуск) | Когда выбирать |
+        |---|---|---|---|
+        | **x64 (64-bit)** | \`MInstAll_x64.exe\` (${SIZE_X64_KB} КБ) | \`MInstAll_x64_portable.zip\` | Современные системы (Win 10/11 64-bit) |
+        | **x86 (32-bit)** | \`MInstAll_x86.exe\` (${SIZE_X86_KB} КБ) | \`MInstAll_x86_portable.zip\` | Старые / 32-bit Windows |
+
+        Не уверен — бери **x64**.
+
+        **Какой вариант выбрать:**
+        - \`.exe\` (--onefile) — один файл, удобно раздавать. Старт ~3-5с на HDD из-за распаковки в TEMP
+        - \`_portable.zip\` (--onedir) — распакуй и запусти \`MInstAll_*.exe\`. **Старт почти мгновенный** даже на HDD
 
         ## Проверка целостности
 
-        После скачивания проверь SHA-256:
-
         \`\`\`powershell
-        Get-FileHash MInstAll_x86.exe -Algorithm SHA256
+        Get-FileHash MInstAll_x64.exe -Algorithm SHA256
         \`\`\`
 
-        Ожидаемое значение (доступно также в файле \`MInstAll_x86.exe.sha256\`):
-        \`\`\`
-        ${SHA}
-        \`\`\`
+        | Файл | SHA-256 |
+        |---|---|
+        | \`MInstAll_x64.exe\` | \`${SHA_X64}\` |
+        | \`MInstAll_x86.exe\` | \`${SHA_X86}\` |
 
-        Размер: ${SIZE_KB} КБ (${SIZE} байт)
+        Также есть отдельные \`.sha256\` файлы (формат GNU sha256sum).
 
         ## Предупреждение SmartScreen
 
@@ -104,8 +176,6 @@ jobs:
         Это нормально — приложение пока без code-signing сертификата. Чтобы запустить:
         1. Нажми **"Подробнее"**
         2. Нажми **"Выполнить в любом случае"**
-
-        После пары запусков Microsoft автоматически добавит репутацию.
 
         ---
         ENDBODY
@@ -124,5 +194,11 @@ jobs:
         files: |
           dist/MInstAll_x86.exe
           dist/MInstAll_x86.exe.sha256
+          dist/MInstAll_x86_portable.zip
+          dist/MInstAll_x86_portable.zip.sha256
+          dist/MInstAll_x64.exe
+          dist/MInstAll_x64.exe.sha256
+          dist/MInstAll_x64_portable.zip
+          dist/MInstAll_x64_portable.zip.sha256
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

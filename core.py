@@ -96,9 +96,18 @@ def validate_cmd(cmd_str: str) -> str | None:
     if not parts:
         return "Пустая команда"
 
-    ext = os.path.splitext(parts[0])[1].lower()
+    first = parts[0].lower()
+    ext = os.path.splitext(first)[1]
+
+    # Системные утилиты вроде winget/choco — без расширения, но разрешены
+    if not ext and os.path.basename(first) in config.ALLOWED_BARE_COMMANDS:
+        return None
+
     if ext and ext not in config.ALLOWED_CMD_EXTENSIONS:
         return f"Недопустимое расширение '{ext}'"
+
+    if not ext:
+        return f"Команда без расширения и не в списке разрешённых: '{parts[0]}'"
 
     return None
 
@@ -138,7 +147,8 @@ UNINSTALL_KEYS = [
 ]
 
 
-def get_installed_programs() -> list[tuple[str, str]]:
+def _get_installed_programs_uncached() -> list[tuple[str, str]]:
+    """Полное чтение реестра — без кеша. ~200-500мс."""
     if os.name != "nt":
         return []
     import winreg
@@ -165,6 +175,43 @@ def get_installed_programs() -> list[tuple[str, str]]:
             except FileNotFoundError:
                 continue
     return entries
+
+
+def get_installed_programs(
+    state_dict: dict | None = None,
+    use_cache: bool = True,
+) -> list[tuple[str, str]]:
+    """
+    Список установленных программ из реестра.
+
+    Если state_dict передан и use_cache=True, использует кеш с TTL.
+    Кеш сохраняется в state_dict["installed_cache"] = {"entries": [...], "ts": time.time()}.
+    """
+    if not use_cache or state_dict is None:
+        return _get_installed_programs_uncached()
+
+    cache = state_dict.get("installed_cache")
+    if isinstance(cache, dict):
+        ts = cache.get("ts", 0)
+        if time.time() - ts < config.INSTALLED_CACHE_TTL_SECONDS:
+            entries = cache.get("entries", [])
+            # entries в JSON хранятся как списки [name, version] — приводим к tuples
+            if isinstance(entries, list):
+                return [tuple(e) for e in entries if isinstance(e, (list, tuple)) and len(e) == 2]
+
+    # Кеш протух или его нет — читаем реестр и сохраняем
+    fresh = _get_installed_programs_uncached()
+    state_dict["installed_cache"] = {
+        "entries": [list(e) for e in fresh],  # JSON-serializable
+        "ts": time.time(),
+    }
+    return fresh
+
+
+def invalidate_installed_cache(state_dict: dict | None) -> None:
+    """Сбрасывает кеш реестра — вызывать после установки/удаления программ."""
+    if state_dict is not None and "installed_cache" in state_dict:
+        del state_dict["installed_cache"]
 
 
 def parse_version(v: str) -> tuple[int, ...]:
@@ -211,6 +258,24 @@ def invalidate_caches() -> None:
     _net_release_cache = (False, None)
 
 
+def _normalize_for_match(s: str) -> str:
+    """
+    Приводит строку к виду удобному для нечёткого сравнения имён программ.
+
+    "Format.Factory"     → "formatfactory"
+    "FormatFactory 5.12" → "formatfactory512"
+    "7-Zip"              → "7zip"
+    "Google Chrome"      → "googlechrome"
+
+    Так что Format.Factory из programs.json матчится с записью реестра
+    "FormatFactory 5.12.2.0" даже если знаки препинания отличаются.
+    """
+    if not s:
+        return ""
+    # Убираем пробелы, точки, дефисы, подчёркивания, скобки, запятые и пр.
+    return re.sub(r"[\s._\-/\\:;,!?()'\"]+", "", s.lower())
+
+
 def check_status(program: dict, installed_entries: list[tuple[str, str]]) -> tuple[str, str]:
     detect = program.get("detect", {}) or {}
     if detect.get("always_runnable"):
@@ -225,8 +290,17 @@ def check_status(program: dict, installed_entries: list[tuple[str, str]]) -> tup
     if path := detect.get("path"):
         return ("ok", "") if os.path.exists(os.path.expandvars(path)) else ("missing", "")
 
-    needle = (detect.get("registry_name") or program["name"]).lower()
-    found_version = next((v for n, v in installed_entries if needle in n.lower()), None)
+    # Нормализуем обе стороны перед сравнением, чтобы пунктуация не мешала
+    needle_raw = (detect.get("registry_name") or program["name"])
+    needle_norm = _normalize_for_match(needle_raw)
+
+    found_version: str | None = None
+    if needle_norm:
+        for n, v in installed_entries:
+            if needle_norm in _normalize_for_match(n):
+                found_version = v
+                break
+
     if found_version is None:
         return ("missing", "")
 
@@ -234,6 +308,106 @@ def check_status(program: dict, installed_entries: list[tuple[str, str]]) -> tup
     if min_v and compare_versions(found_version, min_v) < 0:
         return ("outdated", found_version)
     return ("ok", found_version)
+
+
+def is_installer_available(program: dict) -> bool:
+    """
+    Проверяет, существует ли файл инсталлятора на диске.
+
+    Возвращает:
+      True  — файл есть, системная команда (winget/choco), или указан URL для скачивания
+      False — путь указан, но файла нет
+    """
+    # Если задан URL — программа доступна (файл скачается при установке)
+    if program.get("url"):
+        return True
+
+    cmd_str = program.get("cmd", "")
+    if not cmd_str:
+        return False
+    try:
+        _args, script_path = build_cmd(cmd_str)
+    except ValueError:
+        return False
+    if not script_path:
+        return True
+    return os.path.exists(script_path)
+
+
+# ------------------------------------------------------------------
+# Скачивание инсталлятора по URL во временную папку
+# ------------------------------------------------------------------
+def download_installer(
+    url: str,
+    dest_dir: str,
+    expected_sha256: str | None = None,
+    progress_cb: callable | None = None,
+) -> str:
+    """
+    Скачивает файл по URL в dest_dir и возвращает локальный путь.
+
+    expected_sha256 — если задан, проверяется после скачивания.
+    progress_cb({"downloaded": N, "total": M}) — для прогресса.
+
+    Бросает RuntimeError при ошибке скачивания или несовпадении SHA-256.
+    """
+    import hashlib
+    import urllib.parse
+    import urllib.request
+
+    os.makedirs(dest_dir, exist_ok=True)
+
+    # Имя файла из URL
+    parsed = urllib.parse.urlparse(url)
+    fname = os.path.basename(parsed.path) or "installer.bin"
+    dest_path = os.path.join(dest_dir, fname)
+
+    sha = hashlib.sha256()
+    downloaded = 0
+
+    req = urllib.request.Request(url, headers={"User-Agent": f"MInstAll/{config.APP_VERSION}"})
+    try:
+        with urllib.request.urlopen(req, timeout=config.DOWNLOAD_TIMEOUT) as resp:
+            total = 0
+            try:
+                cl = resp.headers.get("Content-Length")
+                if cl:
+                    total = int(cl)
+            except Exception:
+                pass
+
+            with open(dest_path, "wb") as out:
+                while True:
+                    chunk = resp.read(config.DOWNLOAD_CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    sha.update(chunk)
+                    downloaded += len(chunk)
+                    if progress_cb:
+                        try:
+                            progress_cb({"downloaded": downloaded, "total": total})
+                        except Exception:
+                            pass
+    except Exception as e:
+        try:
+            if os.path.exists(dest_path):
+                os.remove(dest_path)
+        except OSError:
+            pass
+        raise RuntimeError(f"Ошибка скачивания {url}: {e}") from e
+
+    actual_sha = sha.hexdigest().lower()
+    if expected_sha256 and actual_sha != expected_sha256.lower():
+        try:
+            os.remove(dest_path)
+        except OSError:
+            pass
+        raise RuntimeError(
+            f"SHA-256 не совпадает: ожидалось {expected_sha256}, получено {actual_sha}"
+        )
+
+    return dest_path
 
 
 def build_status_cache(
@@ -262,16 +436,23 @@ def build_cmd(cmd_str: str) -> tuple[list[str], str]:
     """
     Возвращает кортеж (cmd_args, script_path), где:
       - cmd_args   — что передавать в subprocess.Popen
-      - script_path — реальный путь к скрипту/установщику для проверки существования
+      - script_path — реальный путь к скрипту/установщику для проверки существования.
+                     Для системных команд (winget) — пустая строка: проверять не надо.
     """
     error = validate_cmd(cmd_str)
     if error:
         raise ValueError(error)
 
     parts = shlex.split(cmd_str, posix=False)
-    script_path = resolve_path(parts[0])
+    first = parts[0]
     user_args = parts[1:]
-    ext = os.path.splitext(parts[0])[1].lower()
+    ext = os.path.splitext(first)[1].lower()
+
+    # Системные команды (winget/choco) — без resolve_path, без проверки наличия файла
+    if not ext and os.path.basename(first).lower() in config.ALLOWED_BARE_COMMANDS:
+        return ([first] + user_args, "")
+
+    script_path = resolve_path(first)
 
     if ext == ".reg":
         return (["regedit", "/s", script_path], script_path)
@@ -352,6 +533,106 @@ def resolve_dependencies(tasks: list[dict], all_programs: dict[str, list[dict]])
     return [task_by_name[name] for name in sorted_names]
 
 
+def topological_levels(
+    tasks: list[dict],
+    all_programs: dict[str, list[dict]],
+) -> list[list[dict]]:
+    """
+    Группирует tasks по топологическим уровням для параллельного выполнения.
+
+    Уровень 0 — задачи без зависимостей (или зависящие только от уже установленных).
+    Уровень 1 — задачи, зависящие только от уровня 0.
+    И т.д.
+
+    Внутри одного уровня задачи можно запускать параллельно — между ними нет зависимостей.
+    Между уровнями порядок строгий: уровень N запускается только после завершения N-1.
+
+    При обнаружении цикла — возвращает все задачи как один уровень (последовательно).
+    """
+    # Сначала восстановим полный список включая авто-подтянутые зависимости
+    sorted_tasks = resolve_dependencies(tasks, all_programs)
+
+    # Индексы по имени
+    task_names = {t["name"] for t in sorted_tasks}
+    task_by_name = {t["name"]: t for t in sorted_tasks}
+
+    # Граф и in_degree (как в resolve_dependencies, но повторим — функция автономная)
+    graph: dict[str, list[str]] = {n: [] for n in task_names}
+    in_degree: dict[str, int] = {n: 0 for n in task_names}
+
+    for name in task_names:
+        for dep_name in task_by_name[name].get("depends_on", []):
+            if dep_name in task_names:
+                graph[dep_name].append(name)
+                in_degree[name] += 1
+
+    # BFS по уровням
+    levels: list[list[dict]] = []
+    current: list[str] = [n for n in task_names if in_degree[n] == 0]
+
+    while current:
+        levels.append([task_by_name[n] for n in current])
+        next_level: list[str] = []
+        for node in current:
+            for neighbor in graph[node]:
+                in_degree[neighbor] -= 1
+                if in_degree[neighbor] == 0:
+                    next_level.append(neighbor)
+        current = next_level
+
+    # Проверка цикла: если кто-то не попал в уровни — возвращаем как fallback
+    placed = sum(len(lvl) for lvl in levels)
+    if placed != len(task_names):
+        logging.warning("Цикл зависимостей при разбиении на уровни, fallback к одному уровню")
+        return [sorted_tasks]
+
+    return levels
+
+
+# ------------------------------------------------------------------
+# Pre/Post hooks — команды до и после установки
+# ------------------------------------------------------------------
+def run_hook(cmd_str: str, hook_name: str = "hook", task_name: str = "") -> bool:
+    """
+    Запускает hook-команду. Возвращает True при успехе.
+
+    В отличие от основной команды — не валится при retryable кодах, не делает откат.
+    Логирует результат и идёт дальше. Используется для pre_cmd/post_cmd.
+    """
+    if not cmd_str:
+        return True
+
+    try:
+        cmd_args, script_path = build_cmd(cmd_str)
+    except ValueError as e:
+        logging.error(f"{hook_name} {task_name}: невалидная команда: {e}")
+        return False
+
+    if not os.path.exists(script_path):
+        logging.warning(f"{hook_name} {task_name}: файл не найден: {script_path}")
+        return False
+
+    try:
+        proc = subprocess.Popen(
+            cmd_args,
+            cwd=os.path.dirname(script_path) or config.SCRIPT_DIR,
+            creationflags=config.CREATE_NO_WINDOW,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        proc.wait(timeout=config.DEFAULT_INSTALL_TIMEOUT)
+        rc = proc.returncode
+        if rc == 0:
+            logging.info(f"{hook_name} {task_name}: OK")
+            return True
+        else:
+            logging.warning(f"{hook_name} {task_name}: код {rc}")
+            return False
+    except Exception as e:
+        logging.exception(f"{hook_name} {task_name}: исключение: {e}")
+        return False
+
+
 # ------------------------------------------------------------------
 # Откат установки (uninstall)
 # ------------------------------------------------------------------
@@ -405,87 +686,6 @@ RETRYABLE_EXIT_CODES = {
 
 
 # ------------------------------------------------------------------
-# Воркер установки — с retry и откатом
-# ------------------------------------------------------------------
-class InstallWorker(threading.Thread):
-    """
-    Эмитит сообщения через dispatch(message_dict).
-    GUI отвечает за маршалинг dispatch в UI-поток.
-
-    Формат сообщений:
-      {"type": "progress",  "text": "...", "severity": "info|progress|warn|error|success"}
-      {"type": "value",     "percent": 42}
-      {"type": "scroll_to", "item_id": <object>}
-      {"type": "finished",  "success": N, "fails": M, "reboot": bool,
-                            "results": {...}, "rollbacks": {...}}
-    """
-
-    def __init__(self, tasks: list[dict], dispatch: callable) -> None:
-        super().__init__(daemon=True)
-        self.tasks = tasks
-        self.dispatch = dispatch
-        self.total_tasks = len(tasks)
-        self._is_running = True
-        self.success_count = 0
-        self.fail_count = 0
-        self.reboot_needed = False
-        self.current_proc: subprocess.Popen | None = None
-        self.results: dict = {}
-        self.rollbacks: dict[str, str] = {}  # name -> "rolled_back" | "rollback_failed" | "no_uninstall"
-
-    def stop(self) -> None:
-        self._is_running = False
-        if self.current_proc:
-            try:
-                self.current_proc.terminate()
-            except Exception:
-                pass
-
-    def _emit(self, **kwargs: object) -> None:
-        self.dispatch(kwargs)
-
-    def _run_single_install(self, cmd_args: list[str], script_path: str, timeout: int) -> int:
-        """Запускает процесс и возвращает returncode. Поднимает исключение при проблемах."""
-        self.current_proc = subprocess.Popen(
-            cmd_args,
-            cwd=os.path.dirname(script_path) or config.SCRIPT_DIR,
-            creationflags=config.CREATE_NO_WINDOW,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-
-        # Запускаем watchdog в фоне — он kill-ает процесс если завис
-        watchdog_stop = threading.Event()
-        watchdog_hung = threading.Event()
-        watchdog_thread = None
-        if config.WATCHDOG_ENABLED:
-            watchdog_thread = threading.Thread(
-                target=_watchdog_monitor,
-                args=(self.current_proc.pid, watchdog_stop, watchdog_hung),
-                daemon=True,
-            )
-            watchdog_thread.start()
-
-        try:
-            try:
-                self.current_proc.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                self.current_proc.kill()
-                self.current_proc.wait()
-                raise subprocess.TimeoutExpired(cmd_args, timeout)
-
-            # Если watchdog убил процесс — сообщим через исключение
-            if watchdog_hung.is_set():
-                raise RuntimeError(f"Процесс завис и был принудительно завершён watchdog'ом")
-
-            return self.current_proc.returncode
-        finally:
-            watchdog_stop.set()
-            if watchdog_thread:
-                watchdog_thread.join(timeout=1.0)
-
-
-# ------------------------------------------------------------------
 # Watchdog: мониторит процесс, kill-ает если завис (нет CPU-активности)
 # ------------------------------------------------------------------
 def _watchdog_monitor(
@@ -508,8 +708,6 @@ def _watchdog_monitor(
     except (psutil.NoSuchProcess, psutil.AccessDenied):
         return
 
-    # cpu_percent с interval=None даёт замер с момента предыдущего вызова,
-    # первый вызов всегда даёт 0 — поэтому "прогреваем"
     try:
         proc.cpu_percent(interval=None)
     except (psutil.NoSuchProcess, psutil.AccessDenied):
@@ -522,8 +720,6 @@ def _watchdog_monitor(
                 return
 
             cpu = proc.cpu_percent(interval=None)
-            # Учитываем CPU и всех дочерних процессов (инсталляторы часто
-            # запускают подпроцессы — установщик может быть idle, но дети работают)
             for child in proc.children(recursive=True):
                 try:
                     cpu += child.cpu_percent(interval=None)
@@ -543,7 +739,6 @@ def _watchdog_monitor(
                     )
                     hung_event.set()
                     try:
-                        # Сначала вежливо детям, потом родителю
                         for child in proc.children(recursive=True):
                             try:
                                 child.kill()
@@ -561,164 +756,415 @@ def _watchdog_monitor(
             logging.exception(f"Watchdog ошибка: {e}")
             return
 
-    def run(self) -> None:
-        try:
-            for index, task in enumerate(self.tasks):
-                item_id = task.get("_item_id")
 
-                if not self._is_running:
-                    self._emit(type="progress", text="Установка отменена.", severity="warn")
+# ------------------------------------------------------------------
+# Воркер установки — поддерживает sequential и parallel режимы
+# ------------------------------------------------------------------
+class InstallWorker(threading.Thread):
+    """
+    Эмитит сообщения через dispatch(message_dict).
+    GUI отвечает за маршалинг dispatch в UI-поток.
+
+    Формат сообщений:
+      {"type": "progress",  "text": "...", "severity": "info|progress|warn|error|success"}
+      {"type": "value",     "percent": 42}
+      {"type": "scroll_to", "item_id": <object>}
+      {"type": "finished",  "success": N, "fails": M, "reboot": bool,
+                            "results": {...}, "rollbacks": {...}}
+
+    Параллельный режим:
+      - tasks разбиваются на топологические уровни через topological_levels()
+      - внутри уровня — ThreadPoolExecutor с max_workers
+      - .msi принудительно сериализуется через семафор (Windows Installer эксклюзивен)
+    """
+
+    def __init__(
+        self,
+        tasks: list[dict],
+        dispatch: callable,
+        parallel: bool = False,
+        max_jobs: int | None = None,
+        all_programs: dict[str, list[dict]] | None = None,
+    ) -> None:
+        super().__init__(daemon=True)
+        self.tasks = tasks
+        self.dispatch = dispatch
+        self.parallel = parallel
+        self.max_jobs = max_jobs or config.MAX_PARALLEL_JOBS
+        self.all_programs = all_programs or {}
+        self.total_tasks = len(tasks)
+        self._is_running = True
+        self.success_count = 0
+        self.fail_count = 0
+        self.reboot_needed = False
+        self.results: dict = {}
+        self.rollbacks: dict[str, str] = {}
+
+        # Параллелизация: набор активных процессов и lock для shared-state
+        self._active_procs: set[subprocess.Popen] = set()
+        self._procs_lock = threading.Lock()
+        self._state_lock = threading.Lock()
+        self._completed_count = 0
+
+        # MSI запускается только по одному за раз
+        self._msi_semaphore = threading.Semaphore(1)
+
+    def stop(self) -> None:
+        self._is_running = False
+        with self._procs_lock:
+            for proc in list(self._active_procs):
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+
+    def _emit(self, **kwargs: object) -> None:
+        self.dispatch(kwargs)
+
+    # ----------------------------------------------------------
+    # Запуск одного процесса с watchdog
+    # ----------------------------------------------------------
+    def _spawn_process(
+        self,
+        cmd_args: list[str],
+        script_path: str,
+        timeout: int,
+    ) -> int:
+        """
+        Запускает один subprocess + watchdog, ждёт завершения. Возвращает returncode.
+        Поднимает subprocess.TimeoutExpired или RuntimeError (для watchdog).
+        """
+        proc = subprocess.Popen(
+            cmd_args,
+            cwd=os.path.dirname(script_path) or config.SCRIPT_DIR,
+            creationflags=config.CREATE_NO_WINDOW,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+        with self._procs_lock:
+            self._active_procs.add(proc)
+
+        watchdog_stop = threading.Event()
+        watchdog_hung = threading.Event()
+        watchdog_thread = None
+        if config.WATCHDOG_ENABLED:
+            watchdog_thread = threading.Thread(
+                target=_watchdog_monitor,
+                args=(proc.pid, watchdog_stop, watchdog_hung),
+                daemon=True,
+            )
+            watchdog_thread.start()
+
+        try:
+            try:
+                proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+                raise subprocess.TimeoutExpired(cmd_args, timeout)
+
+            if watchdog_hung.is_set():
+                raise RuntimeError("Процесс завис и был принудительно завершён watchdog'ом")
+
+            return proc.returncode
+        finally:
+            watchdog_stop.set()
+            if watchdog_thread:
+                watchdog_thread.join(timeout=1.0)
+            with self._procs_lock:
+                self._active_procs.discard(proc)
+
+    # ----------------------------------------------------------
+    # Установка одной задачи целиком (pre, retry-loop, post, rollback)
+    # ----------------------------------------------------------
+    def _install_one_task(self, task: dict, emit_scroll: bool = True) -> None:
+        """Полный жизненный цикл установки одной задачи. Thread-safe."""
+        item_id = task.get("_item_id")
+        name = task["name"]
+        timeout = task.get("timeout", config.DEFAULT_INSTALL_TIMEOUT)
+        max_retries = task.get("retry", 0)
+
+        self._emit(type="progress", text=f"Установка: {name}...", severity="progress")
+        if emit_scroll and item_id:
+            self._emit(type="scroll_to", item_id=item_id)
+
+        # --- Скачивание из URL (если задано) ---
+        if url := task.get("url"):
+            self._emit(type="progress", text=f"Скачивание: {name}...", severity="progress")
+            try:
+                download_dir = os.path.join(
+                    os.environ.get("TEMP", config.SCRIPT_DIR),
+                    "minstall_downloads",
+                )
+
+                def _dl_progress(info: dict) -> None:
+                    total = info.get("total", 0)
+                    if total > 0:
+                        pct = int(info["downloaded"] * 100 / total)
+                        self._emit(type="progress",
+                                   text=f"Скачивание {name}: {pct}%",
+                                   severity="progress")
+
+                downloaded_path = download_installer(
+                    url, download_dir,
+                    expected_sha256=task.get("sha256"),
+                    progress_cb=_dl_progress,
+                )
+                # Подставляем скачанный путь в cmd: первый токен — это файл,
+                # остальное (флаги) — после
+                import shlex as _shlex
+                parts = _shlex.split(task["cmd"], posix=False)
+                # Если в cmd только флаги (нет имени файла) — добавляем downloaded в начало
+                if parts and not os.path.splitext(parts[0])[1]:
+                    # cmd начинается не с файла — например "/silent --install"
+                    new_cmd = _shlex.join([downloaded_path] + parts) if hasattr(_shlex, "join") \
+                        else f'"{downloaded_path}" ' + " ".join(parts)
+                else:
+                    # cmd начинается с файла — заменяем первый токен
+                    new_cmd = _shlex.join([downloaded_path] + parts[1:]) if hasattr(_shlex, "join") \
+                        else f'"{downloaded_path}" ' + " ".join(parts[1:])
+                # build_cmd ожидает не абсолютный путь, а через resolve_path —
+                # поэтому конструируем cmd_args напрямую, в обход validate
+                ext = os.path.splitext(downloaded_path)[1].lower()
+                if ext == ".msi":
+                    cmd_args = ["msiexec", "/i", downloaded_path, "/qn", "/norestart"] + parts[1:]
+                elif ext == ".reg":
+                    cmd_args = ["regedit", "/s", downloaded_path]
+                else:
+                    cmd_args = [downloaded_path] + parts[1:]
+                script_path = downloaded_path
+            except Exception as e:
+                logging.exception(f"Скачивание {name} упало: {e}")
+                self._emit(type="progress", text=f"Ошибка скачивания {name}: {e}",
+                           severity="error")
+                with self._state_lock:
+                    self.fail_count += 1
                     if item_id:
-                        self.results[item_id] = "cancelled"
+                        self.results[item_id] = "fail"
+                return
+        else:
+            # --- Построение команды из локального файла ---
+            try:
+                cmd_args, script_path = build_cmd(task["cmd"])
+            except ValueError as exc:
+                self._emit(type="progress", text=f"{exc}: {name}", severity="error")
+                with self._state_lock:
+                    self.fail_count += 1
+                    if item_id:
+                        self.results[item_id] = "fail"
+                return
+
+        # script_path может быть "" для системных команд (winget) — там нет файла для проверки
+        if script_path and not os.path.exists(script_path):
+            logging.error(f"Файл не найден: {script_path}")
+            self._emit(type="progress", text=f"Файл не найден: {script_path}", severity="error")
+            with self._state_lock:
+                self.fail_count += 1
+                if item_id:
+                    self.results[item_id] = "fail"
+            return
+
+        # --- Pre-hook ---
+        if pre_cmd := task.get("pre_cmd"):
+            self._emit(type="progress", text=f"Подготовка: {name}...", severity="progress")
+            if not run_hook(pre_cmd, "pre_cmd", name):
+                self._emit(type="progress",
+                           text=f"Pre-команда {name} вернула ошибку, продолжаем",
+                           severity="warn")
+
+        # --- MSI должен запускаться эксклюзивно (Windows Installer) ---
+        is_msi = os.path.splitext(task["cmd"].split()[0])[1].lower() == ".msi"
+        if is_msi:
+            self._msi_semaphore.acquire()
+
+        try:
+            attempt = 0
+            last_rc = -1
+            success = False
+
+            while attempt <= max_retries:
+                if not self._is_running:
                     break
 
-                name = task["name"]
-                timeout = task.get("timeout", config.DEFAULT_INSTALL_TIMEOUT)
-                max_retries = task.get("retry", 0)
-                self._emit(type="progress", text=f"Установка: {name}...", severity="progress")
-                if item_id:
-                    self._emit(type="scroll_to", item_id=item_id)
-
-                # --- Построение команды ---
                 try:
-                    cmd_args, script_path = build_cmd(task["cmd"])
-                except ValueError as exc:
-                    self._emit(type="progress", text=f"{exc}: {name}", severity="error")
-                    self.fail_count += 1
-                    if item_id:
-                        self.results[item_id] = "fail"
-                    self._emit(type="value", percent=int(((index + 1) / self.total_tasks) * 100))
-                    continue
+                    if os.name == "nt":
+                        if attempt > 0:
+                            delay = min(5 * (2 ** (attempt - 1)), 30)
+                            self._emit(
+                                type="progress",
+                                text=f"Повтор {attempt}/{max_retries} для {name} "
+                                     f"(через {delay}с)...",
+                                severity="warn",
+                            )
+                            time.sleep(delay)
 
-                # --- Проверка файла ---
-                if not os.path.exists(script_path):
-                    logging.error(f"Файл не найден: {script_path}")
-                    self._emit(type="progress", text=f"Файл не найден: {script_path}", severity="error")
-                    time.sleep(1)
-                    self.fail_count += 1
-                    if item_id:
-                        self.results[item_id] = "fail"
-                    self._emit(type="value", percent=int(((index + 1) / self.total_tasks) * 100))
-                    continue
+                        last_rc = self._spawn_process(cmd_args, script_path, timeout)
 
-                # --- Запуск с retry ---
-                attempt = 0
-                last_returncode = -1
-                success = False
-
-                while attempt <= max_retries:
-                    if not self._is_running:
-                        break
-
-                    try:
-                        if os.name == "nt":
-                            if attempt > 0:
-                                delay = min(5 * (2 ** (attempt - 1)), 30)  # 5, 10, 30 сек
-                                self._emit(
-                                    type="progress",
-                                    text=f"Повтор {attempt}/{max_retries} для {name} "
-                                         f"(через {delay}с)...",
-                                    severity="warn",
-                                )
-                                time.sleep(delay)
-
-                            last_returncode = self._run_single_install(cmd_args, script_path, timeout)
-
-                            if not self._is_running:
-                                break
-
-                            if last_returncode == 0:
-                                success = True
-                                break
-                            elif last_returncode == 3010:
-                                success = True
-                                self.reboot_needed = True
-                                self._emit(type="progress",
-                                           text=f"Требуется перезагрузка для {name}",
-                                           severity="warn")
-                                logging.info(f"OK (нужна перезагрузка): {name}")
-                                break
-                            elif last_returncode in RETRYABLE_EXIT_CODES and attempt < max_retries:
-                                logging.warning(
-                                    f"Retryable код {last_returncode} для {name}, "
-                                    f"попытка {attempt + 1}/{max_retries + 1}"
-                                )
-                                attempt += 1
-                                continue
-                            else:
-                                # Не retryable или попытки кончились
-                                break
-                        else:
-                            # Заглушка для не-Windows
-                            time.sleep(1.5)
-                            success = True
+                        if not self._is_running:
                             break
 
-                    except subprocess.TimeoutExpired:
-                        logging.error(f"Таймаут {timeout}с для {name} (попытка {attempt + 1})")
-                        self._emit(type="progress",
-                                   text=f"Таймаут {name} ({timeout}с)", severity="error")
-                        if attempt < max_retries:
-                            attempt += 1
-                            continue
-                        break
-                    except RuntimeError as e:
-                        # Watchdog убил зависший процесс — retryable
-                        logging.error(f"Watchdog для {name}: {e}")
-                        self._emit(type="progress",
-                                   text=f"Зависание: {name}", severity="error")
-                        if attempt < max_retries:
-                            attempt += 1
-                            continue
-                        break
-                    except Exception as e:
-                        logging.exception(f"Исключение при установке {name}: {e}")
-                        self._emit(type="progress", text=f"Ошибка {name}", severity="error")
-                        break
-                    finally:
-                        self.current_proc = None
-
-                # --- Результат ---
-                if not self._is_running:
-                    if item_id:
-                        self.results[item_id] = "cancelled"
-                    self._emit(type="progress", text=f"Отменено: {name}", severity="warn")
-                    break
-
-                if success:
-                    self.success_count += 1
-                    if item_id:
-                        self.results[item_id] = "ok"
-                    if attempt > 0:
-                        logging.info(f"OK (после {attempt + 1} попыток): {name}")
-                    else:
-                        logging.info(f"OK: {name}")
-                else:
-                    self.fail_count += 1
-                    if item_id:
-                        self.results[item_id] = "fail"
-                    self._emit(type="progress",
-                               text=f"Ошибка {name} (код {last_returncode})",
-                               severity="error")
-                    logging.error(f"Ошибка {name}: код {last_returncode} "
-                                  f"(после {attempt + 1} попыток)")
-
-                    # --- Предложение отката ---
-                    if task.get("uninstall_cmd"):
-                        self._emit(type="progress",
-                                   text=f"Откат {name}...", severity="warn")
-                        if run_uninstall(task):
-                            self.rollbacks[name] = "rolled_back"
+                        if last_rc == 0:
+                            success = True
+                            break
+                        elif last_rc == 3010:
+                            success = True
+                            with self._state_lock:
+                                self.reboot_needed = True
                             self._emit(type="progress",
-                                       text=f"Откат {name}: успешно", severity="info")
+                                       text=f"Требуется перезагрузка для {name}",
+                                       severity="warn")
+                            logging.info(f"OK (нужна перезагрузка): {name}")
+                            break
+                        elif last_rc in RETRYABLE_EXIT_CODES and attempt < max_retries:
+                            logging.warning(
+                                f"Retryable код {last_rc} для {name}, "
+                                f"попытка {attempt + 1}/{max_retries + 1}"
+                            )
+                            attempt += 1
+                            continue
                         else:
-                            self.rollbacks[name] = "rollback_failed"
-                            self._emit(type="progress",
-                                       text=f"Откат {name}: не удался", severity="error")
+                            break
                     else:
-                        self.rollbacks[name] = "no_uninstall"
+                        time.sleep(1.5)
+                        success = True
+                        break
 
-                self._emit(type="value", percent=int(((index + 1) / self.total_tasks) * 100))
+                except subprocess.TimeoutExpired:
+                    logging.error(f"Таймаут {timeout}с для {name} (попытка {attempt + 1})")
+                    self._emit(type="progress",
+                               text=f"Таймаут {name} ({timeout}с)", severity="error")
+                    if attempt < max_retries:
+                        attempt += 1
+                        continue
+                    break
+                except RuntimeError as e:
+                    logging.error(f"Watchdog для {name}: {e}")
+                    self._emit(type="progress",
+                               text=f"Зависание: {name}", severity="error")
+                    if attempt < max_retries:
+                        attempt += 1
+                        continue
+                    break
+                except Exception as e:
+                    logging.exception(f"Исключение при установке {name}: {e}")
+                    self._emit(type="progress", text=f"Ошибка {name}", severity="error")
+                    break
+        finally:
+            if is_msi:
+                self._msi_semaphore.release()
+
+        # --- Результат ---
+        if not self._is_running:
+            with self._state_lock:
+                if item_id:
+                    self.results[item_id] = "cancelled"
+            self._emit(type="progress", text=f"Отменено: {name}", severity="warn")
+            return
+
+        if success:
+            with self._state_lock:
+                self.success_count += 1
+                if item_id:
+                    self.results[item_id] = "ok"
+            if attempt > 0:
+                logging.info(f"OK (после {attempt + 1} попыток): {name}")
+            else:
+                logging.info(f"OK: {name}")
+
+            if post_cmd := task.get("post_cmd"):
+                self._emit(type="progress", text=f"Завершение: {name}...", severity="progress")
+                if not run_hook(post_cmd, "post_cmd", name):
+                    self._emit(type="progress",
+                               text=f"Post-команда {name} вернула ошибку",
+                               severity="warn")
+        else:
+            with self._state_lock:
+                self.fail_count += 1
+                if item_id:
+                    self.results[item_id] = "fail"
+            self._emit(type="progress",
+                       text=f"Ошибка {name} (код {last_rc})", severity="error")
+            logging.error(f"Ошибка {name}: код {last_rc} (после {attempt + 1} попыток)")
+
+            if task.get("uninstall_cmd"):
+                self._emit(type="progress", text=f"Откат {name}...", severity="warn")
+                if run_uninstall(task):
+                    with self._state_lock:
+                        self.rollbacks[name] = "rolled_back"
+                    self._emit(type="progress",
+                               text=f"Откат {name}: успешно", severity="info")
+                else:
+                    with self._state_lock:
+                        self.rollbacks[name] = "rollback_failed"
+                    self._emit(type="progress",
+                               text=f"Откат {name}: не удался", severity="error")
+            else:
+                with self._state_lock:
+                    self.rollbacks[name] = "no_uninstall"
+
+    # ----------------------------------------------------------
+    # Sequential / Parallel runners
+    # ----------------------------------------------------------
+    def _emit_progress_pct(self) -> None:
+        """Эмитит value-сообщение с процентом завершения."""
+        with self._state_lock:
+            self._completed_count += 1
+            pct = int(self._completed_count / self.total_tasks * 100)
+        self._emit(type="value", percent=pct)
+
+    def _run_sequential(self) -> None:
+        """Последовательная установка."""
+        for task in self.tasks:
+            if not self._is_running:
+                item_id = task.get("_item_id")
+                if item_id:
+                    with self._state_lock:
+                        self.results[item_id] = "cancelled"
+                self._emit(type="progress", text="Установка отменена.", severity="warn")
+                break
+
+            self._install_one_task(task, emit_scroll=True)
+            self._emit_progress_pct()
+
+    def _run_parallel(self) -> None:
+        """Параллельная установка по топологическим уровням."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        levels = topological_levels(self.tasks, self.all_programs)
+        logging.info(f"Параллельная установка: {len(levels)} уровней, max_jobs={self.max_jobs}")
+
+        for level_idx, level in enumerate(levels):
+            if not self._is_running:
+                break
+
+            self._emit(
+                type="progress",
+                text=f"Уровень {level_idx + 1}/{len(levels)}: {len(level)} программ параллельно",
+                severity="info",
+            )
+
+            with ThreadPoolExecutor(max_workers=self.max_jobs) as executor:
+                futures = [
+                    executor.submit(self._install_one_task, task, False)
+                    for task in level
+                ]
+                for fut in futures:
+                    try:
+                        fut.result()
+                    except Exception as e:
+                        logging.exception(f"Поток-исполнитель упал: {e}")
+                    self._emit_progress_pct()
+
+    def run(self) -> None:
+        """Точка входа потока — выбирает sequential или parallel."""
+        try:
+            if self.parallel and self.total_tasks > 1:
+                self._run_parallel()
+            else:
+                self._run_sequential()
+        except Exception as e:
+            logging.exception(f"InstallWorker.run упал: {e}")
         finally:
             self._emit(type="finished",
                        success=self.success_count,
