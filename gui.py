@@ -825,7 +825,7 @@ class MInstAllFrame(wx.Frame):
                 # Иконка: 1) явная из json, 2) извлечённая из exe, 3) system.png
                 icon_path = icons.resolve_program_icon(prog, core.resolve_path)
                 if not icon_path:
-                    fallback = core.resolve_path(prog.get("icon") or "icons/system.png")
+                    fallback = config.resource_path(prog.get("icon") or "icons/system.png")
                     if os.path.exists(fallback):
                         icon_path = fallback
 
