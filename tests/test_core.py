@@ -100,6 +100,16 @@ class TestValidateCmd(unittest.TestCase):
         err = core.validate_cmd("")
         self.assertIsNotNone(err)
 
+    def test_quoted_windows_path(self) -> None:
+        self.assertIsNone(core.validate_cmd(r'"software\My App\setup.exe" /S'))
+
+    def test_unclosed_quote(self) -> None:
+        self.assertIsNotNone(core.validate_cmd('"software/My App/setup.exe'))
+
+    def test_quoted_path_does_not_bypass_validation(self) -> None:
+        self.assertIsNotNone(core.validate_cmd('"software/My App/setup.py"'))
+        self.assertIsNotNone(core.validate_cmd('"software/My App/setup.exe" & whoami'))
+
 
 # ------------------------------------------------------------------
 # build_cmd
@@ -138,6 +148,57 @@ class TestBuildCmd(unittest.TestCase):
     def test_empty_raises(self) -> None:
         with self.assertRaises(ValueError):
             core.build_cmd("")
+
+    def test_paths_with_spaces_and_quoted_arguments(self) -> None:
+        for extension in ("exe", "msi", "bat", "cmd", "ps1", "reg"):
+            with self.subTest(extension=extension):
+                relative_path = rf'software\My App\setup.{extension}'
+                args, path = core.build_cmd(f'"{relative_path}" /name "My App"')
+                self.assertEqual(path, core.resolve_path(relative_path))
+                self.assertIn(path, args)
+                if extension != "reg":
+                    self.assertEqual(args[-2:], ["/name", "My App"])
+                if extension == "msi":
+                    self.assertEqual(args[:3], ["msiexec", "/i", path])
+
+    def test_unclosed_quote_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            core.build_cmd('"software/My App/setup.exe')
+
+
+class TestInstallExitCodes(unittest.TestCase):
+    def test_success_and_reboot_codes_do_not_retry_or_rollback(self) -> None:
+        for code in (0, 3010, 1641):
+            with self.subTest(code=code):
+                task = {"name": "Sample", "cmd": '"software/My App/setup.msi"',
+                        "retry": 1, "uninstall_cmd": "uninstall.exe", "_item_id": "sample"}
+                worker = core.InstallWorker([task], lambda msg: None)
+                with patch("core.os.name", "nt"), \
+                     patch("core.os.path.exists", return_value=True), \
+                     patch.object(worker, "_spawn_process", return_value=code) as spawn, \
+                     patch.object(worker, "_msi_semaphore") as semaphore, \
+                     patch("core.run_uninstall") as rollback:
+                    worker._install_one_task(task)
+                spawn.assert_called_once()
+                semaphore.acquire.assert_called_once()
+                semaphore.release.assert_called_once()
+                rollback.assert_not_called()
+                self.assertEqual(worker.success_count, 1)
+                self.assertEqual(worker.fail_count, 0)
+                self.assertEqual(worker.results["sample"], "ok")
+                self.assertEqual(worker.reboot_needed, code != 0)
+
+    def test_failure_remains_a_failure(self) -> None:
+        task = {"name": "Sample", "cmd": "setup.exe", "_item_id": "sample"}
+        worker = core.InstallWorker([task], lambda msg: None)
+        with patch("core.os.name", "nt"), \
+             patch("core.os.path.exists", return_value=True), \
+             patch.object(worker, "_spawn_process", return_value=1603):
+            worker._install_one_task(task)
+        self.assertEqual(worker.success_count, 0)
+        self.assertEqual(worker.fail_count, 1)
+        self.assertEqual(worker.results["sample"], "fail")
+        self.assertFalse(worker.reboot_needed)
 
 
 # ------------------------------------------------------------------
