@@ -700,16 +700,18 @@ RETRYABLE_EXIT_CODES = {
 
 
 # ------------------------------------------------------------------
-# Watchdog: мониторит процесс, kill-ает если завис (нет CPU-активности)
+# Watchdog: диагностирует низкую CPU-активность, не завершает установщик
 # ------------------------------------------------------------------
 def _watchdog_monitor(
     pid: int,
     stop_event: threading.Event,
-    hung_event: threading.Event,
 ) -> None:
     """
     Раз в WATCHDOG_SAMPLE_INTERVAL секунд снимает CPU% процесса.
-    Если CPU < WATCHDOG_CPU_THRESHOLD WATCHDOG_HANG_THRESHOLD раз подряд — kill.
+    После нескольких тихих замеров пишет предупреждение один раз за период
+    простоя. Низкий CPU не доказывает зависание: процесс может ждать диск,
+    сеть или Windows Installer Service. Завершение ограничивается заданным
+    таймаутом установки и явной отменой пользователя.
     """
     try:
         import psutil
@@ -746,22 +748,12 @@ def _watchdog_monitor(
                     f"Watchdog PID={pid}: тихий замер {silent_count}/"
                     f"{config.WATCHDOG_HANG_THRESHOLD} (CPU={cpu:.2f}%)"
                 )
-                if silent_count >= config.WATCHDOG_HANG_THRESHOLD:
+                if silent_count == config.WATCHDOG_HANG_THRESHOLD:
                     logging.warning(
-                        f"Watchdog PID={pid}: процесс завис "
-                        f"({silent_count} замеров без CPU), завершаем"
+                        f"Watchdog PID={pid}: низкая CPU-активность "
+                        f"({silent_count} тихих замеров); ожидаем завершения "
+                        "установщика, таймаута или отмены"
                     )
-                    hung_event.set()
-                    try:
-                        for child in proc.children(recursive=True):
-                            try:
-                                child.kill()
-                            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                                pass
-                        proc.kill()
-                    except (psutil.NoSuchProcess, psutil.AccessDenied):
-                        pass
-                    return
             else:
                 silent_count = 0
         except (psutil.NoSuchProcess, psutil.AccessDenied):
@@ -846,7 +838,7 @@ class InstallWorker(threading.Thread):
     ) -> int:
         """
         Запускает один subprocess + watchdog, ждёт завершения. Возвращает returncode.
-        Поднимает subprocess.TimeoutExpired или RuntimeError (для watchdog).
+        Поднимает subprocess.TimeoutExpired при превышении таймаута установки.
         """
         proc = subprocess.Popen(
             cmd_args,
@@ -860,12 +852,11 @@ class InstallWorker(threading.Thread):
             self._active_procs.add(proc)
 
         watchdog_stop = threading.Event()
-        watchdog_hung = threading.Event()
         watchdog_thread = None
         if config.WATCHDOG_ENABLED:
             watchdog_thread = threading.Thread(
                 target=_watchdog_monitor,
-                args=(proc.pid, watchdog_stop, watchdog_hung),
+                args=(proc.pid, watchdog_stop),
                 daemon=True,
             )
             watchdog_thread.start()
@@ -877,9 +868,6 @@ class InstallWorker(threading.Thread):
                 proc.kill()
                 proc.wait()
                 raise subprocess.TimeoutExpired(cmd_args, timeout)
-
-            if watchdog_hung.is_set():
-                raise RuntimeError("Процесс завис и был принудительно завершён watchdog'ом")
 
             return proc.returncode
         finally:
@@ -1048,14 +1036,6 @@ class InstallWorker(threading.Thread):
                     logging.error(f"Таймаут {timeout}с для {name} (попытка {attempt + 1})")
                     self._emit(type="progress",
                                text=f"Таймаут {name} ({timeout}с)", severity="error")
-                    if attempt < max_retries:
-                        attempt += 1
-                        continue
-                    break
-                except RuntimeError as e:
-                    logging.error(f"Watchdog для {name}: {e}")
-                    self._emit(type="progress",
-                               text=f"Зависание: {name}", severity="error")
                     if attempt < max_retries:
                         attempt += 1
                         continue
