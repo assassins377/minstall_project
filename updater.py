@@ -9,6 +9,7 @@ import subprocess
 import threading
 import urllib.request
 import logging
+import re
 from typing import Callable
 
 import config
@@ -41,6 +42,22 @@ def sha256_asset_name() -> str:
     return f"{exe_asset_name()}.sha256"
 
 
+def _validate_sha256(value: object) -> str:
+    if not isinstance(value, str) or re.fullmatch(r"[0-9a-fA-F]{64}", value) is None:
+        raise ValueError("Ожидается SHA-256 из 64 шестнадцатеричных символов")
+    return value.lower()
+
+
+def _parse_sha256(text: str, filename: str) -> str:
+    """Accept a bare digest or one GNU sha256sum entry for the selected EXE."""
+    match = re.fullmatch(r"([0-9a-fA-F]{64})(?:[ \t]+\*?([^\r\n]+))?", text.strip())
+    if match is None:
+        raise ValueError("Некорректный формат файла SHA-256")
+    if match[2] is not None and match[2] != filename:
+        raise ValueError(f"SHA-256 относится к другому файлу: {match[2]}")
+    return _validate_sha256(match[1])
+
+
 # ------------------------------------------------------------------
 # Проверка обновлений через GitHub Releases API
 # ------------------------------------------------------------------
@@ -66,8 +83,8 @@ def check_for_updates(current_version: str | None = None) -> dict:
        "size": int | None, "notes": str}
     или {"error": str} при сбое.
 
-    Если в Release есть файл .sha256 — он скачивается для верификации.
-    Если нет — SHA-256 верификация пропускается (с предупреждением в логе).
+    Для новой версии требуется доступный и корректный файл .sha256.
+    Без него автоматическое обновление не предлагается.
     """
     current = current_version or config.APP_VERSION
 
@@ -83,6 +100,8 @@ def check_for_updates(current_version: str | None = None) -> dict:
         return {"error": "Не удалось определить версию релиза (отсутствует tag_name)"}
 
     notes = release.get("body", "") or ""
+    if core.compare_versions(tag, current) <= 0:
+        return {"has_update": False, "latest": tag, "notes": notes}
     assets = release.get("assets", []) or []
 
     # Динамическое имя по архитектуре текущего процесса (x86 / x64)
@@ -99,21 +118,15 @@ def check_for_updates(current_version: str | None = None) -> dict:
     if not exe_url:
         return {"error": f"У файла {exe_name} нет ссылки на скачивание"}
 
-    # Опционально: .sha256 — отдельный файл с хешем
-    sha256: str | None = None
+    # Контрольная сумма обязательна для автоматического обновления.
     sha_asset = next((a for a in assets if a.get("name") == sha_name), None)
-    if sha_asset and (sha_url := sha_asset.get("browser_download_url")):
-        try:
-            sha_text = _fetch_text(sha_url, timeout=5)
-            # Формат может быть: "abc123..." или "abc123...  MInstAll_x86.exe"
-            sha256 = sha_text.split()[0].lower()
-        except Exception as e:
-            logging.warning(f"Не удалось прочитать {sha_name}: {e}")
-
-    if not sha256:
-        logging.warning(
-            f"В релизе v{tag} нет {sha_name} — обновление пройдёт без верификации SHA-256"
-        )
+    if not sha_asset or not (sha_url := sha_asset.get("browser_download_url")):
+        return {"error": f"Автообновление недоступно: в релизе v{tag} нет ссылки на {sha_name}"}
+    try:
+        sha256 = _parse_sha256(_fetch_text(sha_url, timeout=5), exe_name)
+    except Exception as e:
+        logging.warning(f"Не удалось проверить {sha_name}: {e}")
+        return {"error": f"Автообновление недоступно: не удалось проверить {sha_name}: {e}"}
 
     has_update = core.compare_versions(tag, current) > 0
     return {
@@ -178,7 +191,7 @@ def download_and_update(
     callback: Callable[[dict], None] | None = None,
 ) -> bool:
     """
-    Скачивает обновление, проверяет SHA-256 (если он есть в update_info),
+    Скачивает обновление и обязательно проверяет SHA-256,
     формирует BAT для атомарной замены, запускает его и завершает процесс.
     """
     def emit(msg: dict) -> None:
@@ -190,6 +203,12 @@ def download_and_update(
 
     if not getattr(sys, "frozen", False):
         emit({"type": "error", "text": "Обновление работает только для собранного .exe"})
+        return False
+
+    try:
+        expected_sha = _validate_sha256(update_info.get("sha256"))
+    except ValueError as e:
+        emit({"type": "error", "text": f"Обновление отменено: {e}"})
         return False
 
     current_exe = sys.executable
@@ -211,25 +230,16 @@ def download_and_update(
             update_info["url"], new_exe_path, update_info.get("size"), emit
         )
 
-        # Верификация SHA-256 — только если ожидаемый хеш известен
-        expected_sha = update_info.get("sha256")
-        if expected_sha:
-            if actual_sha != expected_sha.lower():
-                logging.error(
-                    f"SHA-256 не совпадает. Ожидалось {expected_sha}, получено {actual_sha}"
-                )
-                try:
-                    os.remove(new_exe_path)
-                except OSError:
-                    pass
-                emit({"type": "error",
-                      "text": "Контрольная сумма не совпадает. Файл повреждён или подменён."})
-                return False
-            logging.info(f"Обновление скачано и проверено: SHA-256 {actual_sha}")
-        else:
-            logging.warning(
-                f"SHA-256 верификация пропущена (хеш не предоставлен). Загружено: {actual_sha}"
-            )
+        if actual_sha != expected_sha:
+            logging.error(f"SHA-256 не совпадает. Ожидалось {expected_sha}, получено {actual_sha}")
+            try:
+                os.remove(new_exe_path)
+            except OSError:
+                pass
+            emit({"type": "error",
+                  "text": "Контрольная сумма не совпадает. Файл повреждён или подменён."})
+            return False
+        logging.info(f"Обновление скачано и проверено: SHA-256 {actual_sha}")
 
         emit({"type": "status", "text": "Применение обновления..."})
 

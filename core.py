@@ -86,13 +86,28 @@ def load_programs_from_json() -> dict[str, list[dict]]:
 # ------------------------------------------------------------------
 # Валидация команд
 # ------------------------------------------------------------------
+def _split_cmd(cmd_str: str) -> list[str]:
+    """Разбивает команду, сохраняя Windows-пути и снимая внешние двойные кавычки.
+
+    subprocess получает список аргументов и сам добавляет нужные кавычки.
+    posix=False сохраняет обратные слеши в путях.
+    """
+    return [
+        token[1:-1] if token.startswith('"') and token.endswith('"') else token
+        for token in shlex.split(cmd_str, posix=False)
+    ]
+
+
 def validate_cmd(cmd_str: str) -> str | None:
     """Проверяет команду на shell-инъекции. Возвращает текст ошибки или None."""
     for char in config.SHELL_METACHARACTERS:
         if char in cmd_str:
             return f"Недопустимый символ '{char}' в команде"
 
-    parts = shlex.split(cmd_str, posix=False)
+    try:
+        parts = _split_cmd(cmd_str)
+    except ValueError:
+        return "Незакрытые кавычки в команде"
     if not parts:
         return "Пустая команда"
 
@@ -443,7 +458,7 @@ def build_cmd(cmd_str: str) -> tuple[list[str], str]:
     if error:
         raise ValueError(error)
 
-    parts = shlex.split(cmd_str, posix=False)
+    parts = _split_cmd(cmd_str)
     first = parts[0]
     user_args = parts[1:]
     ext = os.path.splitext(first)[1].lower()
@@ -681,7 +696,6 @@ def run_uninstall(task: dict) -> bool:
 RETRYABLE_EXIT_CODES = {
     1618,   # ERROR_INSTALL_ALREADY_RUNNING — другой MSI запущен
     1603,   # ERROR_INSTALL_FAILURE — общая ошибка (иногда transient)
-    1641,   # ERROR_SUCCESS_REBOOT_INITIATED (установщик перезапускается)
 }
 
 
@@ -962,7 +976,7 @@ class InstallWorker(threading.Thread):
                            severity="warn")
 
         # --- MSI должен запускаться эксклюзивно (Windows Installer) ---
-        is_msi = os.path.splitext(task["cmd"].split()[0])[1].lower() == ".msi"
+        is_msi = os.path.splitext(script_path)[1].lower() == ".msi"
         if is_msi:
             self._msi_semaphore.acquire()
 
@@ -995,7 +1009,7 @@ class InstallWorker(threading.Thread):
                         if last_rc == 0:
                             success = True
                             break
-                        elif last_rc == 3010:
+                        elif last_rc in (3010, 1641):
                             success = True
                             with self._state_lock:
                                 self.reboot_needed = True

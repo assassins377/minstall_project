@@ -7,8 +7,27 @@ if getattr(sys, 'frozen', False):
 else:
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
+def resource_path(rel_path: str) -> str:
+    """Find a resource beside the app, in a frozen bundle, or in the wheel.
+
+    External resources take precedence so portable installations can customize
+    profiles, translations and icons. Writable installer files stay in SCRIPT_DIR.
+    """
+    external = os.path.join(SCRIPT_DIR, rel_path)
+    if os.path.exists(external):
+        return external
+    bundle_dir = getattr(sys, "_MEIPASS", None)
+    if bundle_dir:
+        bundled = os.path.join(bundle_dir, rel_path)
+        if os.path.exists(bundled):
+            return bundled
+    import minstall_data
+    packaged = os.path.join(os.path.dirname(minstall_data.__file__), rel_path)
+    return packaged if os.path.exists(packaged) else external
+
+
 CONFIG_FILE = os.path.join(SCRIPT_DIR, "programs.json")
-ICON_FILE = os.path.join(SCRIPT_DIR, "icons", "system.png")
+ICON_FILE = resource_path(os.path.join("icons", "system.png"))
 
 # --- Безопасное логирование (в %LOCALAPPDATA%\MInstAll) ---
 LOG_DIR = os.path.join(os.environ.get('LOCALAPPDATA', SCRIPT_DIR), 'MInstAll')
