@@ -31,7 +31,7 @@ DEFAULT_LANGUAGE = "ru"
 FALLBACK_LANGUAGE = "ru"
 
 # Папка с json-файлами переводов
-I18N_DIR = os.path.join(config.SCRIPT_DIR, "i18n")
+I18N_DIR = config.resource_path("i18n")
 
 # Активные переводы — _translations[lang][key] = "перевод"
 _translations: dict[str, dict[str, str]] = {}

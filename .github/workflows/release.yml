@@ -52,7 +52,7 @@ jobs:
 
     - name: Компилируем MInstAll_${{ matrix.arch }}.exe (--onefile)
       run: |
-        pyinstaller --clean --noconsole --onefile --uac-admin --name MInstAll_${{ matrix.arch }} --icon=icons/system.png main.py
+        pyinstaller --clean --noconsole --onefile --uac-admin --name MInstAll_${{ matrix.arch }} --icon=icons/app.ico --add-data "i18n;i18n" --add-data "profiles;profiles" --add-data "icons;icons" main.py
 
     - name: Создаём .sha256 для onefile
       shell: pwsh
@@ -63,7 +63,7 @@ jobs:
 
     - name: Компилируем --onedir версию (быстрый запуск)
       run: |
-        pyinstaller --clean --noconsole --uac-admin --name MInstAll_${{ matrix.arch }}_dir --icon=icons/system.png main.py
+        pyinstaller --clean --noconsole --uac-admin --name MInstAll_${{ matrix.arch }}_dir --icon=icons/app.ico --add-data "i18n;i18n" --add-data "profiles;profiles" --add-data "icons;icons" main.py
 
     - name: Архивируем --onedir в .zip
       shell: pwsh

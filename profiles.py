@@ -18,7 +18,7 @@ from typing import Any
 import config
 
 
-PROFILES_DIR = os.path.join(config.SCRIPT_DIR, "profiles")
+PROFILES_DIR = config.resource_path("profiles")
 
 
 def load_profile(path: str) -> dict[str, Any] | None:
