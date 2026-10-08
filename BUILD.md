@@ -1,6 +1,6 @@
 # Сборка MInstAll
 
-Инструкция по компиляции MInstAll из исходников для Windows 7/10/11 и Linux.
+Инструкция по сборке MInstAll для Windows 10/11 и запуску исходников для разработки на Linux.
 
 ---
 
@@ -29,9 +29,9 @@
 | Свободное место | 500 МБ | 1 ГБ |
 | ОЗУ для сборки | 2 ГБ | 4 ГБ |
 
-**Главное приложение работает на:** Windows 7+ (32-bit и 64-bit), Linux с GTK3.
+**Целевая платформа установки:** Windows 10/11; архитектуры сборки — x86 и x64. На Linux с GTK3 доступна разработка и проверка логики, но не установка Windows-программ. Совместимость со старыми Windows отдельно не подтверждена.
 
-**Сборка `.exe`-инсталлятора:** только Windows (PyInstaller компилирует под целевую ОС).
+**Сборка приложения `.exe`:** только Windows (PyInstaller компилирует под целевую ОС).
 
 ---
 
@@ -93,7 +93,7 @@ python main.py
 
 ```powershell
 pip install pyinstaller
-pyinstaller --clean --noconsole --onefile --uac-admin --name MInstAll_x64 --icon=icons/system.png main.py
+pyinstaller --clean --noconsole --onefile --uac-admin --name MInstAll_x64 --icon=icons/app.ico --add-data "i18n;i18n" --add-data "profiles;profiles" --add-data "icons;icons" main.py
 ```
 
 Готовый файл будет в `dist\MInstAll_x64.exe`.
@@ -104,65 +104,9 @@ pyinstaller --clean --noconsole --onefile --uac-admin --name MInstAll_x64 --icon
 
 ## Windows 7
 
-Windows 7 официально поддерживается, но требует осторожности с версией Python.
+Текущий проект требует Python >=3.10, и CI собирает EXE на Python 3.10. По [документации Python](https://docs.python.org/3.10/using/windows.html) эта версия поддерживает Windows 8.1 и новее, поэтому обещать работу текущих сборок на Windows 7 нельзя.
 
-### Какой Python использовать
-
-| Версия Python | Win7 SP1 |
-|---|---|
-| 3.8 | ✅ Последняя официально поддерживаемая |
-| 3.9 — 3.11 | ⚠ Работают неофициально, нужны KB-обновления |
-| 3.12+ | ❌ Не запустится |
-
-**Рекомендация для Win7:** Python **3.8.10** (последний релиз с официальным инсталлятором для Win7).
-
-### Шаг 1 — Подготовка системы
-
-Установите обязательные обновления Windows 7:
-
-- **KB4474419** — поддержка SHA-2 (обязательно для всех скачиваний)
-- **KB4490628** — Servicing Stack Update
-- **Visual C++ Redistributable 2015-2022** ([download](https://aka.ms/vs/17/release/vc_redist.x86.exe))
-
-Без этих обновлений Python 3.10+ не запустится, а pip не скачает пакеты (TLS 1.2 не работает без SHA-2).
-
-### Шаг 2 — Установка Python 3.8
-
-Скачайте [Python 3.8.10](https://www.python.org/downloads/release/python-3810/) → Windows x86 installer.
-
-При установке:
-- ✅ **Add Python 3.8 to PATH**
-- Customize → **Install for all users**
-
-### Шаг 3 — Обновление pip
-
-Стандартный pip в Python 3.8 не умеет TLS 1.2 — нужно обновить через прокси-команду:
-
-```powershell
-python -m pip install --upgrade pip --trusted-host pypi.org --trusted-host files.pythonhosted.org
-```
-
-### Шаг 4 — Установка зависимостей
-
-```powershell
-pip install wxPython==4.2.1 psutil pyinstaller pytest
-```
-
-⚠ **Не используй `requirements.txt` напрямую** на Win7 — там может быть `wxPython>=4.2.0` без верхней границы, и pip попробует поставить более новую версию которая не соберётся.
-
-### Шаг 5 — Сборка
-
-```powershell
-pyinstaller --clean --noconsole --onefile --uac-admin --name MInstAll_x86 --icon=icons/system.png main.py
-```
-
-Получившийся `dist\MInstAll_x86.exe` будет запускаться на Win7/8/10/11.
-
-### Известные проблемы Windows 7
-
-- **"VCRUNTIME140_1.dll отсутствует"** — установи Visual C++ Redistributable 2015-2022
-- **Высокий DPI выглядит размыто** — добавь к `.exe` Manifest с `dpiAware = true` (PyInstaller делает это автоматически)
-- **Pip не работает с pypi.org** — обнови корневые сертификаты Windows через `certutil -generateSSTFromWU rootscerts.sst`
+Python 3.8 поддерживал Windows 7, но не удовлетворяет требованиям этого проекта. Для Windows 7 нужна отдельная адаптация кода и зависимостей и проверка на реальной системе; готового подтверждённого варианта сейчас нет. Выбор x86 вместо x64 эту проблему не решает.
 
 ---
 
@@ -281,56 +225,27 @@ yay -S python-wxpython
 
 ## Сборка `.exe` через PyInstaller
 
-### Базовая команда
+### Базовая команда (PowerShell на Windows)
 
-```bash
-pyinstaller \
-    --clean \
-    --noconsole \
-    --onefile \
-    --name MInstAll_x64 \
-    --icon=icons/system.png \
-    main.py
+```powershell
+pyinstaller --clean --noconsole --onefile --uac-admin --name MInstAll_x64 --icon=icons/app.ico --add-data "i18n;i18n" --add-data "profiles;profiles" --add-data "icons;icons" main.py
 ```
-
-### Что означают флаги
 
 | Флаг | Что делает |
 |---|---|
 | `--clean` | Удаляет временные файлы предыдущей сборки |
-| `--noconsole` | Не показывать чёрное консольное окно при запуске GUI |
-| `--onefile` | Один `.exe` вместо папки с зависимостями |
-| `--name X` | Имя выходного файла |
-| `--icon=path.png` | Иконка `.exe` |
+| `--noconsole` | Создаёт GUI-приложение без консольного окна |
+| `--onefile` | Собирает один EXE; без этого флага получается папка с зависимостями |
+| `--uac-admin` | Запрашивает права администратора при запуске |
+| `--name X` | Задаёт имя файла; архитектура определяется Python, а не именем |
+| `--icon=icons/app.ico` | Использует готовую Windows-иконку без конвертации PNG |
+| `--add-data` | Включает переводы, профили и иконки |
 
-### Дополнительные оптимизации
+### Ресурсы и пользовательские файлы
 
-**Уменьшить размер `.exe`:**
+Каталоги `i18n`, `profiles` и `icons` включаются в EXE. Файлы рядом с приложением имеют приоритет над встроенными ресурсами. Кеш извлечённых иконок хранится в `%LOCALAPPDATA%\MInstAll\icons\cache`.
 
-```bash
-pyinstaller --clean --noconsole --onefile \
-    --strip \
-    --exclude-module tkinter \
-    --exclude-module unittest \
-    --exclude-module test \
-    --name MInstAll_x64 \
-    --icon=icons/system.png \
-    main.py
-```
-
-Это убирает 5-10 МБ ненужных модулей.
-
-**Включить дополнительные файлы (иконки и т.д.):**
-
-```bash
-pyinstaller --clean --noconsole --onefile \
-    --add-data "icons;icons" \
-    --add-data "programs.json;." \
-    --name MInstAll_x64 \
-    main.py
-```
-
-⚠ Сейчас файлы читаются из соседней папки (PyInstaller `--onefile` распаковывает их во временную директорию), поэтому `--add-data` не обязателен — но если хочешь полностью самодостаточный `.exe`, добавь его.
+`programs.json` и каталог `software/` остаются внешними пользовательскими данными рядом с EXE. Добавлять их внутрь EXE не нужно. Для Python-пакета `pip install .` упаковывает модули и ресурсы через `pyproject.toml`.
 
 ### Результат сборки
 
@@ -349,10 +264,11 @@ MInstAll_x64.spec  ← конфиг PyInstaller (для повторных сб�
 После сборки запусти `dist\MInstAll_x64.exe` и проверь:
 
 1. ✅ Окно открывается без ошибок
-2. ✅ Список программ загружается из `programs.json` (положи его рядом с `.exe`)
-3. ✅ Иконки отображаются (положи папку `icons/` рядом с `.exe`)
+2. ✅ Список программ строится из `software/`; при необходимости используются метаданные внешнего `programs.json`
+3. ✅ Встроенные иконки и переводы отображаются без внешних папок `icons/` и `i18n/`
 4. ✅ Меню "Справка → О программе" работает
-5. ✅ Поиск фильтрует список
+5. ✅ Поиск фильтрует список, доступны три встроенных профиля
+6. ✅ На тестовой системе проверены установка и отмена; обновление проверено с совпадающим и несовпадающим SHA-256
 
 ### Запуск тестов перед сборкой
 
@@ -362,7 +278,7 @@ MInstAll_x64.spec  ← конфиг PyInstaller (для повторных сб�
 python -m pytest tests/ -v
 ```
 
-Ожидаемо: **64 passed in ~0.05s**.
+Все тесты должны проходить. Количество и длительность зависят от текущей версии; успешная сборка в CI не заменяет ручную проверку GUI и установки на Windows.
 
 ### Проверка `.exe` антивирусом
 
@@ -397,79 +313,58 @@ pip install --upgrade pyinstaller
 
 Это нормально для PyInstaller `--onefile` — файл распаковывается во временную папку при каждом запуске.
 
-**Решение:** собирай без `--onefile` (получится папка с `.exe` + DLL'ками, но запускается мгновенно):
+**Решение:** собирай без `--onefile` (получится папка с `.exe` + DLL'ками, без распаковки зависимостей при каждом запуске):
 
-```bash
-pyinstaller --clean --noconsole --name MInstAll_x64 --icon=icons/system.png main.py
+```powershell
+pyinstaller --clean --noconsole --uac-admin --name MInstAll_x64 --icon=icons/app.ico --add-data "i18n;i18n" --add-data "profiles;profiles" --add-data "icons;icons" main.py
 ```
 
 ### `wxPython` не собирается на Linux: `error: GTK+ 3.0 not found`
 
 Установи GTK-dev пакеты (см. секцию своего дистрибутива выше).
 
-### `psutil` не ставится на Win7
-
-Возьми wheel напрямую:
-
-```powershell
-pip install psutil --only-binary :all:
-```
-
-Или установи Visual C++ Build Tools для компиляции из исходников.
-
 ### Антивирус удаляет `.exe`
 
-Добавь папку `dist/` в исключения антивируса на время разработки.
+Проверь источник, контрольную сумму и причину обнаружения. Если считаешь обнаружение ложным, отправь файл на проверку производителю антивируса.
 
-Для production-релиза опубликуй `.exe` через GitHub Releases — Microsoft постепенно набирает репутацию для часто скачиваемых файлов.
+Публикация в GitHub Releases сама по себе не гарантирует исчезновение предупреждений SmartScreen. Репутация зависит от нескольких сигналов, фиксированного порога нет; новая неподписанная сборка набирает её заново. См. [Microsoft Learn](https://learn.microsoft.com/en-us/windows/apps/package-and-deploy/smartscreen-reputation).
 
 ### Сборка вылетает с `RecursionError`
 
-PyInstaller иногда упирается в Python default `sys.setrecursionlimit`. Увеличь:
-
-```bash
-pyinstaller --clean --noconsole --onefile \
-    --runtime-tmpdir . \
-    main.py
-```
-
-Или добавь в начало `main.py`:
-
-```python
-import sys
-sys.setrecursionlimit(5000)
-```
+Проверь traceback: ошибка может возникать в анализаторе PyInstaller или в самом приложении. Параметр `--runtime-tmpdir` меняет каталог распаковки и не исправляет глубину рекурсии. Для ошибки анализа сборки настрой предел рекурсии в `.spec` согласно traceback и повтори сборку.
 
 ---
 
 ## Сборка через CI (GitHub Actions)
 
-Самый простой способ собрать `.exe` для x86 и x64 — пушнуть тег в GitHub:
+Build & Test проверяет изменения и собирает EXE для x86/x64 при push в `main` и при pull request. Для публикации Release используется новый тег версии (подставь согласованную версию вместо примера):
 
 ```bash
-git tag v2.1.0
-git push origin v2.1.0
+git tag vX.Y.Z
+git push origin vX.Y.Z
 ```
 
 CI автоматически:
-1. Запустит 64 теста (`pytest`)
+1. Запустит тесты (`pytest`)
 2. Соберёт `MInstAll_x86.exe` (на 32-битном Python)
 3. Соберёт `MInstAll_x64.exe` (на 64-битном Python) — **параллельно**
-4. Создаст SHA-256 для каждого файла
+4. Соберёт `MInstAll_x86_portable.zip` и `MInstAll_x64_portable.zip`, создаст `.sha256` для каждого EXE и ZIP
 5. Опубликует GitHub Release с инструкцией для пользователей
 
-Полный пайплайн занимает ~5 минут. См. [.github/workflows/release.yml](.github/workflows/release.yml).
+Время выполнения зависит от доступности runners и установки зависимостей. См. [.github/workflows/release.yml](.github/workflows/release.yml).
 
 ### Скачивание готовых сборок без локальной компиляции
 
-[**MInstAll Releases**](https://github.com/assassins377/minstall_project/releases/latest) — всегда содержит последние x86 и x64 сборки.
+[**MInstAll Releases**](https://github.com/assassins377/minstall_project/releases) содержит опубликованные релизы. Если их ещё нет, EXE доступны в артефактах успешного [Build & Test](https://github.com/assassins377/minstall_project/actions/workflows/build.yml). Portable ZIP и `.sha256` формирует Release-пайплайн при публикации тега.
+
+Для современной 64-битной Windows выбирай x64; для 32-битной — x86. Имена файлов и команды SHA-256 приведены в [README.md](README.md#скачать). Готовый Linux-бинарник не публикуется.
 
 ---
 
 ## Что дальше
 
 - [README.md](README.md) — что умеет MInstAll, как использовать
-- [tests/](tests/) — 64 unit-теста, изучи перед добавлением фич
+- [tests/](tests/) — unit-тесты, изучи перед добавлением фич
 - [.github/workflows/](.github/workflows/) — CI/CD конфигурация
 
 ## Лицензия
