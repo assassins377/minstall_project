@@ -180,6 +180,8 @@ jobs:
         ---
         ENDBODY
 
+        cat RELEASE_NOTES.md >> release_body.md
+
         echo "body_path=release_body.md" >> "$GITHUB_OUTPUT"
 
     - name: Создаём GitHub Release
