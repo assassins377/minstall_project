@@ -30,10 +30,10 @@ RESULT_CANCELLED = "↺"
 CREATE_NO_WINDOW = 0x08000000
 DEFAULT_INSTALL_TIMEOUT = 900  # секунд (15 мин)
 
-# --- Watchdog: детекция зависших инсталляторов ---
+# --- Watchdog: диагностическое предупреждение о низкой CPU-активности ---
 WATCHDOG_ENABLED = True
 WATCHDOG_SAMPLE_INTERVAL = 30  # секунды между замерами
-WATCHDOG_HANG_THRESHOLD = 5    # сколько подряд "тихих" замеров → killing
+WATCHDOG_HANG_THRESHOLD = 5    # сколько подряд "тихих" замеров → предупреждение
 WATCHDOG_CPU_THRESHOLD = 0.5   # CPU% ниже которого считаем процесс "тихим"
 
 # --- Параллельная установка ---
