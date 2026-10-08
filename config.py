@@ -35,7 +35,7 @@ os.makedirs(LOG_DIR, exist_ok=True)
 LOG_FILE = os.path.join(LOG_DIR, "install.log")
 
 # --- Версионирование ---
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.2.1"
 CONFIG_VERSION = 2
 
 # --- Символы UI ---
