@@ -21,7 +21,7 @@ import wx
 import config
 
 
-ICON_CACHE_DIR = os.path.join(config.SCRIPT_DIR, "icons", "cache")
+ICON_CACHE_DIR = os.path.join(config.LOG_DIR, "icons", "cache")
 
 
 # ====================================================================
@@ -179,7 +179,7 @@ def resolve_program_icon(program: dict, software_dir_resolver) -> str | None:
     # 1. Явный icon из programs.json (если файл существует)
     icon_path = program.get("icon", "")
     if icon_path:
-        abs_path = software_dir_resolver(icon_path)
+        abs_path = config.resource_path(icon_path)
         # Системная заглушка system.png пропускаем — пробуем найти что-то лучше
         if os.path.exists(abs_path) and not abs_path.endswith("system.png"):
             return abs_path
@@ -200,7 +200,7 @@ def resolve_program_icon(program: dict, software_dir_resolver) -> str | None:
 
     # 3. Возвращаем system.png если он указан в icon, иначе None
     if icon_path:
-        abs_path = software_dir_resolver(icon_path)
+        abs_path = config.resource_path(icon_path)
         if os.path.exists(abs_path):
             return abs_path
 

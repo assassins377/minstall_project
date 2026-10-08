@@ -54,7 +54,21 @@ Issues = "https://github.com/assassins377/minstall_project/issues"
 # =====================================================================
 
 [tool.setuptools]
-py-modules = ["main", "config", "core", "gui", "updater", "state"]
+py-modules = [
+    "main", "config", "core", "gui", "updater", "state",
+    "cli", "i18n", "profiles", "scanner", "stats", "icons", "log_panel",
+]
+packages = ["minstall_data", "minstall_data.i18n", "minstall_data.profiles", "minstall_data.icons"]
+
+[tool.setuptools.package-dir]
+"minstall_data.i18n" = "i18n"
+"minstall_data.profiles" = "profiles"
+"minstall_data.icons" = "icons"
+
+[tool.setuptools.package-data]
+"minstall_data.i18n" = ["*.json"]
+"minstall_data.profiles" = ["*.json"]
+"minstall_data.icons" = ["*.png", "*.ico"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
